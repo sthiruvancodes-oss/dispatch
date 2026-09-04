@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-import xml.sax.saxutils
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,8 +11,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
+from twilio.request_validator import RequestValidator
 
 from agent_runner import AgentRunner
+from voice_agent import VoiceAgentSession, call_registry
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -29,10 +29,11 @@ _origins = [
     for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
     if origin.strip()
 ]
+# No IP or *.trycloudflare.com wildcard: with allow_credentials those made every
+# quick tunnel on the internet a permitted credentialed origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9-]+\.trycloudflare\.com)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,35 +44,66 @@ class TaskRequest(BaseModel):
     instruction: str = Field(min_length=1)
 
 
-_GREETING_RE = re.compile(
-    r"^(hi+|hey+|hello+|yo|sup|what'?s up|how are you|good (morning|afternoon|evening)|"
-    r"yeah|yes|ok|okay|um+|uh+|hmm+|thanks|thank you)[\s.!]*$",
-    re.I,
-)
+def _allowed_callers() -> list[str]:
+    """Numbers permitted to call in. Empty means reject everyone.
+
+    Deny-by-default is deliberate: an unset allowlist must never mean that any
+    caller can drive a browser that holds your logins.
+    """
+    raw = os.getenv("ALLOWED_CALLERS", "")
+    return [number.strip() for number in raw.split(",") if number.strip()]
 
 
-def _is_real_instruction(speech: str) -> bool:
-    text = " ".join(speech.split())
-    if not text:
+def _is_allowed_caller(number: str) -> bool:
+    return bool(number) and number.strip() in _allowed_callers()
+
+
+def _signature_candidates(request: Request) -> list[str]:
+    """URLs Twilio might have signed. It signs the URL exactly as configured,
+    so a trailing slash or a proxy-rewritten host changes the signature."""
+    path = request.url.path
+    query = request.url.query
+    bases = []
+    env_base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    if env_base:
+        bases.append(env_base)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        bases.append(f"{proto}://{host}")
+        bases.append(f"https://{host}")
+    seen, urls = set(), []
+    for base in bases:
+        for suffix in (path, path + "/"):
+            for full in ((f"{base}{suffix}?{query}",) if query else ()) + (f"{base}{suffix}",):
+                if full not in seen:
+                    seen.add(full)
+                    urls.append(full)
+    return urls
+
+
+def _signature_ok(request: Request, form: dict[str, str]) -> bool:
+    """Verify X-Twilio-Signature so only Twilio can reach the voice endpoints."""
+    token = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+    if not token:
+        logger.warning("TWILIO_AUTH_TOKEN unset; refusing unverified voice request")
         return False
-    if _GREETING_RE.match(text):
-        return False
-    words = re.findall(r"[a-zA-Z0-9']+", text)
-    if len(words) < 3:
-        return False
-    return True
-
-
-def _gather(request: Request, prompt: str) -> Response:
-    collect = f"{_public_base(request)}/voice/collect"
-    return _twiml(
-        f"""
-  <Gather input="speech" action="{collect}" method="POST" speechTimeout="auto" timeout="10">
-    <Say>{prompt}</Say>
-  </Gather>
-  <Say>Still here. Call back if you have a task.</Say>
-"""
+    signature = request.headers.get("X-Twilio-Signature", "")
+    validator = RequestValidator(token)
+    candidates = _signature_candidates(request)
+    for url in candidates:
+        if validator.validate(url, form, signature):
+            if url != candidates[0]:
+                logger.warning(
+                    "Twilio signed %s, not %s — set PUBLIC_BASE_URL to match "
+                    "the webhook URL exactly.", url, candidates[0]
+                )
+            return True
+    logger.warning(
+        "Signature mismatch. signature_present=%s tried=%s form_keys=%s",
+        bool(signature), candidates, sorted(form),
     )
+    return False
 
 
 def _public_base(request: Request) -> str:
@@ -88,11 +120,6 @@ def _twiml(body: str) -> Response:
         content=f'<?xml version="1.0" encoding="UTF-8"?>\n<Response>{body}</Response>',
         media_type="application/xml",
     )
-
-
-def _say_text(text: str, limit: int = 1200) -> str:
-    cleaned = " ".join((text or "Done. Nothing to report.").split())
-    return xml.sax.saxutils.escape(cleaned[:limit])
 
 
 def _task_payload(session) -> dict:
@@ -187,69 +214,39 @@ async def task_ws(websocket: WebSocket, task_id: str):
 
 @app.post("/voice")
 async def voice_incoming(request: Request):
-    """Inbound Twilio call. Ask for a spoken task."""
-    return _gather(
-        request,
-        "Hey. What should I do in the browser?",
-    )
+    """Inbound call: verify it's really Twilio, verify the caller, then hand the
+    audio to the Deepgram voice agent over a bidirectional Media Stream."""
+    form = dict(await request.form())
+
+    if not _signature_ok(request, form):
+        logger.warning("Rejected /voice with a bad Twilio signature")
+        return Response(status_code=403)
+
+    caller = str(form.get("From") or "")
+    if not _is_allowed_caller(caller):
+        logger.warning("Rejected call from %s (not in ALLOWED_CALLERS)", caller)
+        return _twiml("<Say>Sorry, this number isn't available.</Say><Hangup/>")
+
+    call_sid = str(form.get("CallSid") or "")
+    call_registry.authorize(call_sid)
+    logger.info("Accepted call %s from %s", call_sid, caller)
+
+    stream = f"{_public_base(request).replace('https://', 'wss://')}/voice/stream"
+    # <Connect>, not <Start>: audio has to flow back to the caller.
+    return _twiml(f'<Connect><Stream url="{stream}" /></Connect>')
 
 
-@app.post("/voice/collect")
-async def voice_collect(request: Request):
-    """Twilio posts SpeechResult. Start the same agent as POST /tasks."""
-    form = await request.form()
-    speech = str(form.get("SpeechResult") or "").strip()
-    logger.info("Twilio speech: %s", speech)
-
-    if not _is_real_instruction(speech):
-        return _gather(
-            request,
-            "Didn't catch a task. Say the site and what to do, like search Facebook Marketplace for a couch.",
-        )
-
+@app.websocket("/voice/stream")
+async def voice_stream(websocket: WebSocket):
+    """Twilio Media Stream. Authorization is checked against the CallSid that
+    POST /voice registered, since the WebSocket upgrade carries no signature."""
+    await websocket.accept()
+    session = VoiceAgentSession(websocket, runner)
     try:
-        session = await runner.start_task(speech, source="phone")
-    except RuntimeError:
-        return _twiml(
-            "<Say>Already on a task. Try in a bit.</Say><Hangup/>"
-        )
-    except ValueError:
-        return _twiml("<Say>Agent isn't set up. Check the server logs.</Say><Hangup/>")
-
-    wait = f"{_public_base(request)}/voice/wait/{session.task_id}"
-    return _twiml(
-        f"""
-  <Say>Got it. I'll talk through what I'm doing.</Say>
-  <Pause length="10"/>
-  <Redirect method="POST">{wait}</Redirect>
-"""
-    )
-
-
-@app.api_route("/voice/wait/{task_id}", methods=["GET", "POST"])
-async def voice_wait(task_id: str, request: Request):
-    """Stay on the line until the agent finishes, then read the result."""
-    session = runner.tasks.get(task_id)
-    if session is None:
-        return _twiml("<Say>Lost that one. Bye.</Say><Hangup/>")
-
-    if session.status == "running":
-        wait = f"{_public_base(request)}/voice/wait/{task_id}"
-        line = session.consume_spoken()
-        if line:
-            return _twiml(
-                f"""
-  <Say>{_say_text(line, limit=280)}</Say>
-  <Pause length="10"/>
-  <Redirect method="POST">{wait}</Redirect>
-"""
-            )
-        return _twiml(
-            f"""
-  <Pause length="10"/>
-  <Redirect method="POST">{wait}</Redirect>
-"""
-        )
-
-    spoken = _say_text(session.result or "")
-    return _twiml(f"<Say>{spoken}</Say><Hangup/>")
+        await session.run()
+    except WebSocketDisconnect:
+        logger.info("Caller hung up")
+        await session.aclose()
+    except Exception:
+        logger.exception("Voice session failed")
+        await session.aclose()

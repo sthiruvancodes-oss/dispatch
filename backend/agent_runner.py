@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -12,14 +13,52 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from browser_use import Agent, Browser, ChatAnthropic
+from browser_use import Agent, Browser, ChatOpenAI
 
 logger = logging.getLogger("dispatch.agent")
 
 VIEWPORT = {"width": 1280, "height": 720}
 FRAME_INTERVAL_S = 0.5
 MAX_STEPS = 60
+MAX_RUN_SECONDS = int(os.getenv("MAX_RUN_SECONDS", "600"))
+STEP_TIMEOUT_S = int(os.getenv("STEP_TIMEOUT_S", "120"))
 PROFILE_DIR = Path(__file__).resolve().parent / ".browser-profile"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _allowed_domains() -> list[str]:
+    """Domains the agent may navigate to. Empty means unrestricted."""
+    raw = os.getenv("ALLOWED_DOMAINS", "")
+    return [d.strip() for d in raw.split(",") if d.strip()]
+
+
+def _playwright_chrome_paths() -> list[Path]:
+    """Chrome for Testing builds cached by `playwright install chromium`.
+
+    browser-use only finds these through its own installer. Falling back to the
+    cache means a machine without Chrome still runs instead of dying at launch.
+    """
+    roots = [
+        Path.home() / "Library/Caches/ms-playwright",   # macOS
+        Path.home() / ".cache/ms-playwright",           # Linux
+    ]
+    found: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for chromium in sorted(root.glob("chromium-*"), reverse=True):
+            app = "Google Chrome for Testing"
+            found.extend(
+                chromium.glob(f"chrome-*/{app}.app/Contents/MacOS/{app}")
+            )
+            found.extend(chromium.glob("chrome-*/chrome"))
+    return found
 
 
 def _system_chrome_path() -> Path | None:
@@ -28,6 +67,7 @@ def _system_chrome_path() -> Path | None:
         Path("/usr/bin/google-chrome"),
         Path("/usr/bin/google-chrome-stable"),
         Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        *_playwright_chrome_paths(),
     ]
     for path in candidates:
         if path.exists():
@@ -37,10 +77,22 @@ def _system_chrome_path() -> Path | None:
 
 def _make_browser() -> Browser:
     """Prefer real Chrome. Bundled Chromium gets blocked on a lot of sites."""
+    # Highlighting draws overlays into the page. Great for the live view, but it
+    # mutates the DOM the vision model reads, so it's a flag rather than a constant.
+    highlight = _env_flag("HIGHLIGHT_ELEMENTS", True)
+    allowed = _allowed_domains()
+
     cdp = (os.getenv("CHROME_CDP_URL") or "").strip()
     if cdp:
         logger.info("Attaching to existing Chrome via %s", cdp)
-        return Browser(cdp_url=cdp, is_local=True, highlight_elements=True)
+        cdp_kwargs: dict[str, Any] = {
+            "cdp_url": cdp,
+            "is_local": True,
+            "highlight_elements": highlight,
+        }
+        if allowed:
+            cdp_kwargs["allowed_domains"] = allowed
+        return Browser(**cdp_kwargs)
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     kwargs: dict[str, Any] = {
@@ -49,7 +101,7 @@ def _make_browser() -> Browser:
         "window_size": VIEWPORT,
         "keep_alive": True,
         "user_data_dir": str(PROFILE_DIR),
-        "highlight_elements": True,
+        "highlight_elements": highlight,
         "wait_between_actions": 0.6,
         "ignore_default_args": ["--enable-automation"],
         "args": [
@@ -59,6 +111,9 @@ def _make_browser() -> Browser:
             "--no-default-browser-check",
         ],
     }
+    if allowed:
+        kwargs["allowed_domains"] = allowed
+        logger.info("Browser restricted to: %s", ", ".join(allowed))
     chrome = _system_chrome_path()
     if chrome is not None:
         kwargs["executable_path"] = str(chrome)
@@ -79,26 +134,18 @@ You can:
 - open a new message, type what they asked, and hit Send
 - check that it actually sent (or that you're logged in) before you stop
 
-Do what they asked. Don't open Facebook, Marketplace, Craigslist, or some other site unless they named it or asked for listings.
-
-If they want listings, used stuff, apartments, cars, furniture, or things for sale: Facebook Marketplace only. Not Craigslist or other classifieds.
+Do what they asked. Go to the site they named. If they didn't name one, pick whichever site actually
+answers their question, and say which one you picked.
 If they just said hi or didn't give a real task, don't browse. Stop and say you're waiting.
 
 Never type the strings "x_user" or "x_pass" unless this task actually gave those placeholders.
-Don't invent passwords. If you hit a login wall and have no credentials, stay on that page. Someone may log in in this same window. Then keep going. Don't quit just because of a login screen.
+Don't invent passwords. If you hit a login wall and have no credentials, stay on that page.
+Someone may log in in this same window. Then keep going. Don't quit just because of a login screen.
 If a click fails, try another button or link before you give up.
 """.strip()
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
 _PLACEHOLDER_RE = re.compile(r"\b(x_user|x_pass)\b", re.I)
-_CLASSIFIEDS_RE = re.compile(
-    r"\b(craigslist|kijiji|offerup|ebay|letgo)\b",
-    re.I,
-)
-_LISTING_INTENT_RE = re.compile(
-    r"\b(listing|listings|marketplace|for sale|used |apartment|furniture|couch|classifieds|car for)\b",
-    re.I,
-)
 
 TaskStatus = Literal["running", "done", "error"]
 TaskSource = Literal["web", "phone"]
@@ -118,7 +165,9 @@ def _ensure_virtual_display() -> Any | None:
         logger.info("Started Xvfb virtual display")
         return display
     except Exception:
-        logger.warning("No DISPLAY and pyvirtualdisplay/Xvfb unavailable; browser may fail to launch")
+        logger.warning(
+            "No DISPLAY and pyvirtualdisplay/Xvfb unavailable; browser may fail to launch"
+        )
         return None
 
 
@@ -137,19 +186,19 @@ def _format_step(agent: Agent) -> str:
             if text:
                 parts.append(str(text).strip())
     except Exception:
-        pass
+        logger.debug("Could not read model_thoughts", exc_info=True)
     try:
         actions = agent.history.model_actions()
         if actions:
             parts.append(f"action: {actions[-1]}")
     except Exception:
-        pass
+        logger.debug("Could not read model_actions", exc_info=True)
     try:
         urls = agent.history.urls()
         if urls and urls[-1]:
             parts.append(f"url: {urls[-1]}")
     except Exception:
-        pass
+        logger.debug("Could not read urls", exc_info=True)
     text = " / ".join(parts) if parts else "Step completed"
     return _redact(text)
 
@@ -167,7 +216,8 @@ def _redact(text: str, extra: list[str] | None = None) -> str:
     return out
 
 
-def _for_speech(text: str, extra: list[str] | None = None) -> str:
+def _for_speech(text: str, extra: list[str] | None = None, limit: int = 180) -> str:
+    """Strip anything that sounds wrong read aloud: URLs, markdown, secrets."""
     cleaned = _redact(str(text), extra=extra)
     cleaned = _URL_RE.sub("", cleaned)
     cleaned = _PLACEHOLDER_RE.sub("", cleaned)
@@ -175,8 +225,8 @@ def _for_speech(text: str, extra: list[str] | None = None) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,;:")
     if not cleaned:
         return ""
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rsplit(" ", 1)[0]
+    if len(cleaned) > limit:
+        cleaned = cleaned[: limit - 3].rsplit(" ", 1)[0]
     if cleaned[-1] not in ".!?":
         cleaned += "."
     return cleaned[0].upper() + cleaned[1:]
@@ -203,7 +253,8 @@ def _speakable_step(agent: Agent) -> str:
     return ""
 
 
-def _build_sensitive_data() -> dict[str, str]:
+def _credentials() -> dict[str, str]:
+    """Placeholder -> real value, straight from the environment."""
     user = (os.getenv("LOGIN_USERNAME") or "").strip()
     pw = (os.getenv("LOGIN_PASSWORD") or "").strip()
     data: dict[str, str] = {}
@@ -214,28 +265,56 @@ def _build_sensitive_data() -> dict[str, str]:
     return data
 
 
-def _steer_listings(instruction: str) -> str:
-    text = instruction.strip()
-    if _CLASSIFIEDS_RE.search(text) or _LISTING_INTENT_RE.search(text):
-        text += (
-            " Use Facebook Marketplace only. Skip Craigslist and other classifieds."
+def _build_sensitive_data() -> dict[str, dict[str, str]]:
+    """Credentials scoped to one domain pattern, so they can't be typed into any site.
+
+    browser-use requires allowed_domains whenever sensitive_data is set. If either
+    LOGIN_DOMAIN or ALLOWED_DOMAINS is missing we drop the credentials rather than
+    hand them to an unrestricted browser.
+    """
+    creds = _credentials()
+    if not creds:
+        return {}
+
+    domain = (os.getenv("LOGIN_DOMAIN") or "").strip()
+    if not domain:
+        logger.warning(
+            "LOGIN_USERNAME/LOGIN_PASSWORD are set but LOGIN_DOMAIN is empty. "
+            "Credentials withheld — set LOGIN_DOMAIN (e.g. https://*.example.com)."
         )
-    return text
+        return {}
+    if not _allowed_domains():
+        logger.warning(
+            "Credentials configured but ALLOWED_DOMAINS is empty. Credentials "
+            "withheld — an unrestricted browser must not carry logins."
+        )
+        return {}
+    return {domain: creds}
 
 
-def _task_text(instruction: str, sensitive: dict[str, str], source: TaskSource) -> str:
-    extra = [
-        "Only do what the user asked. Don't open Facebook Marketplace unless they asked for listings."
-    ]
-    steered = _steer_listings(instruction)
-    if steered != instruction.strip():
-        extra.append(
-            "Listings search: Facebook Marketplace only. Not Craigslist."
-        )
-        extra.append(
-            "Search Marketplace, open listings, scroll. Don't stop on the homepage if they asked what's for sale."
-        )
-    if "x_user" in sensitive and "x_pass" in sensitive:
+def _preferred_sites() -> list[str]:
+    """Optional PREFERRED_SITES nudge. Unset means the instruction decides."""
+    raw = os.getenv("PREFERRED_SITES", "")
+    return [site.strip() for site in raw.split(",") if site.strip()]
+
+
+def _preferred_sites_hint() -> str:
+    sites = _preferred_sites()
+    if not sites:
+        return ""
+    listed = ", ".join(sites)
+    return (
+        f"If the task doesn't name a site, prefer one of these: {listed}. "
+        "If the user named a different site, use theirs instead."
+    )
+
+
+def _task_text(instruction: str, placeholders: set[str], source: TaskSource) -> str:
+    extra = ["Only do what the user asked."]
+    hint = _preferred_sites_hint()
+    if hint:
+        extra.append(hint)
+    if "x_user" in placeholders and "x_pass" in placeholders:
         extra.append(
             "If there's a login form, sign in with username x_user and password x_pass."
         )
@@ -243,14 +322,15 @@ def _task_text(instruction: str, sensitive: dict[str, str], source: TaskSource) 
         "If they asked you to send a message, type it, click send, and check it posted."
     )
     extra.append(
-        "If you hit a login wall and can't continue, wait in this browser for someone to log in, then keep going."
+        "If you hit a login wall and can't continue, wait in this browser for someone "
+        "to log in, then keep going."
     )
     if source == "phone":
         extra.append(
-            "They're on a phone call. Final result should be a short spoken summary of what you did. "
-            "Names and prices only if you searched listings. No URLs, no markdown."
+            "They're on a phone call. Final result should be a short spoken summary "
+            "of what you did. No URLs, no markdown."
         )
-    return steered + "\n\n" + " ".join(extra)
+    return instruction.strip() + "\n\n" + " ".join(extra)
 
 
 async def _screenshot_jpeg_b64(browser: Browser) -> str | None:
@@ -262,8 +342,6 @@ async def _screenshot_jpeg_b64(browser: Browser) -> str | None:
     if not data:
         return None
     if isinstance(data, bytes):
-        import base64
-
         return base64.b64encode(data).decode("ascii")
     text = str(data)
     if text.startswith("data:"):
@@ -286,8 +364,6 @@ class TaskSession:
     agent: Agent | None = None
     stop_requested: bool = False
     spoken: list[str] = field(default_factory=list)
-    spoken_index: int = 0
-    last_spoken: str = ""
 
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
@@ -298,22 +374,14 @@ class TaskSession:
         if queue in self.subscribers:
             self.subscribers.remove(queue)
 
-    def push_spoken(self, text: str) -> None:
+    def push_spoken(self, text: str) -> str | None:
+        """Record a narration line. Returns it, or None if dropped as a repeat."""
         line = _for_speech(text, extra=self.secrets)
         if not line:
-            return
+            return None
         if self.spoken and _similar_speech(self.spoken[-1], line):
-            return
+            return None
         self.spoken.append(line)
-
-    def consume_spoken(self) -> str | None:
-        if self.spoken_index >= len(self.spoken):
-            return None
-        line = self.spoken[-1]
-        self.spoken_index = len(self.spoken)
-        if self.last_spoken and _similar_speech(self.last_spoken, line):
-            return None
-        self.last_spoken = line
         return line
 
     async def emit(self, message: dict[str, Any]) -> None:
@@ -323,6 +391,13 @@ class TaskSession:
         elif kind == "log" and message.get("text"):
             message["text"] = _redact(str(message["text"]), extra=self.secrets)
             self.logs.append(str(message["text"]))
+            # Also to the server log: a phone call has no WebSocket viewer, so
+            # without this the agent's steps are invisible after the fact.
+            logger.info("[%s] %s", self.task_id[:8], message["text"])
+        elif kind == "done":
+            logger.info("[%s] DONE %s", self.task_id[:8], message.get("result"))
+        elif kind == "speak":
+            logger.info("[%s] SPEAK %s", self.task_id[:8], message.get("text"))
         for queue in list(self.subscribers):
             await queue.put(message)
 
@@ -354,8 +429,8 @@ class AgentRunner:
         if not instruction:
             raise ValueError("instruction is required")
 
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise ValueError("ANTHROPIC_API_KEY is not set")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY is not set")
 
         sensitive = _build_sensitive_data()
 
@@ -364,7 +439,8 @@ class AgentRunner:
             if running:
                 raise RuntimeError(f"A task is already running ({running.task_id})")
             session = TaskSession(instruction=instruction, source=source)
-            session.secrets = [v for v in sensitive.values() if v]
+            # Redaction works off the real values, whatever domain they're scoped to.
+            session.secrets = [v for v in _credentials().values() if v]
             self.tasks[session.task_id] = session
             self.latest_task_id = session.task_id
             self._active = asyncio.create_task(self._run(session, sensitive))
@@ -412,7 +488,7 @@ class AgentRunner:
             except Exception:
                 pass
 
-    async def _run(self, session: TaskSession, sensitive: dict[str, str]) -> None:
+    async def _run(self, session: TaskSession, sensitive: dict[str, dict[str, str]]) -> None:
         if self._display is None:
             self._display = _ensure_virtual_display()
 
@@ -421,8 +497,11 @@ class AgentRunner:
         capture_task: asyncio.Task | None = None
 
         try:
-            model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-            llm = ChatAnthropic(model=model, temperature=0.0)
+            model = os.getenv("BROWSER_MODEL", "gpt-4.1")
+            # Low by default: picking which element to click is not a place
+            # for sampling variety. The voice agent runs hotter, separately.
+            temperature = float(os.getenv("BROWSER_TEMPERATURE", "0.0"))
+            llm = ChatOpenAI(model=model, temperature=temperature)
             browser = _make_browser()
             session.browser = browser
             await session.emit({"type": "log", "text": f"Starting agent with {model}"})
@@ -442,7 +521,10 @@ class AgentRunner:
                 await session.emit(
                     {
                         "type": "log",
-                        "text": "Login from .env (hidden). Cookies stay in the local Chrome profile.",
+                        "text": (
+                            "Login from .env (hidden), scoped to its domain. "
+                            "Cookies stay in the local Chrome profile."
+                        ),
                     }
                 )
 
@@ -450,14 +532,22 @@ class AgentRunner:
                 await session.emit({"type": "log", "text": _format_step(agent)})
                 spoken = _speakable_step(agent)
                 if spoken:
-                    session.push_spoken(spoken)
+                    line = session.push_spoken(spoken)
+                    if line:
+                        # Pushed to the live call the moment the step lands.
+                        await session.emit({"type": "speak", "text": line})
 
+            placeholders = {k for creds in sensitive.values() for k in creds}
             agent_kwargs: dict[str, Any] = {
-                "task": _task_text(session.instruction, sensitive, session.source),
+                "task": _task_text(session.instruction, placeholders, session.source),
                 "llm": llm,
                 "browser": browser,
                 "use_vision": True,
                 "extend_system_message": INTERACT_INSTRUCTIONS,
+                # Batch related actions (a login is username + password + submit in one step).
+                "max_actions_per_step": 4,
+                "max_failures": 3,
+                "step_timeout": STEP_TIMEOUT_S,
             }
             if sensitive:
                 agent_kwargs["sensitive_data"] = sensitive
@@ -465,7 +555,11 @@ class AgentRunner:
             agent = Agent(**agent_kwargs)
             session.agent = agent
             capture_task = asyncio.create_task(self._capture_loop(session, stop))
-            history = await agent.run(on_step_end=on_step_end, max_steps=MAX_STEPS)
+            # MAX_STEPS alone can't stop a run that stalls inside a step.
+            history = await asyncio.wait_for(
+                agent.run(on_step_end=on_step_end, max_steps=MAX_STEPS),
+                timeout=MAX_RUN_SECONDS,
+            )
 
             result = ""
             try:
@@ -491,6 +585,12 @@ class AgentRunner:
             session.result = result
             await session.emit({"type": "log", "text": f"Done: {result}"})
             await session.emit({"type": "done", "result": result})
+        except TimeoutError:
+            logger.warning("Task %s hit the %ss budget", session.task_id, MAX_RUN_SECONDS)
+            session.status = "error"
+            session.result = f"Gave up after {MAX_RUN_SECONDS} seconds."
+            await session.emit({"type": "log", "text": session.result})
+            await session.emit({"type": "done", "result": session.result})
         except Exception as exc:
             if session.stop_requested:
                 session.status = "done"

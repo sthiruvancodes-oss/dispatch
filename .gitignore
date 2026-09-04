@@ -17,6 +17,7 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/tsconfig.tsbuildinfo
 
 # OS / IDE
 .DS_Store
