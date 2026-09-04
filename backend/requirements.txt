@@ -5,3 +5,6 @@ python-dotenv>=1.0.1
 pydantic>=2.0.0
 python-multipart>=0.0.9
 pyvirtualdisplay>=3.0
+twilio>=9.0.0
+# 14.0 renamed extra_headers -> additional_headers on the asyncio client.
+websockets>=14.0

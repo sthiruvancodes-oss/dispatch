@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const ACCEPTANCE =
-  "Search Facebook Marketplace for a used couch near me and tell me the top listings with prices.";
+  "Go to news.ycombinator.com and tell me the top five stories with their points.";
 
 function backendBase() {
   const fromEnv = process.env.NEXT_PUBLIC_BACKEND_URL;
@@ -201,7 +201,7 @@ export default function Page() {
           <textarea
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
-            placeholder="Search Facebook Marketplace for a used bike under $200"
+            placeholder="Tell the agent which site to open and what to do there"
             disabled={busy}
           />
         </div>
@@ -231,7 +231,7 @@ export default function Page() {
             <img alt="Live agent browser" src={frameSrc} />
           ) : (
             <div className="placeholder">
-              Type a task and hit Run. Login is in backend/.env.
+              Type a task and hit Run.
             </div>
           )}
         </div>
